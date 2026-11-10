@@ -15,6 +15,7 @@ import (
 	"github.com/omec-project/openapi/v2"
 	"github.com/omec-project/openapi/v2/Nnrf_NFManagement"
 	"github.com/omec-project/openapi/v2/models"
+	openapiutils "github.com/omec-project/openapi/v2/utils"
 	pcfContext "github.com/omec-project/pcf/context"
 	"github.com/omec-project/pcf/logger"
 )
@@ -32,7 +33,12 @@ func getNfProfile(pcfContext *pcfContext.PCFContext, nfProfileDynamicConfig NfPr
 	profile.SetNfInstanceId(pcfContext.NfId)
 	profile.SetNfType(models.NFTYPE_PCF)
 	profile.SetNfStatus(models.NFSTATUS_REGISTERED)
-	profile.SetIpv4Addresses(append(profile.GetIpv4Addresses(), pcfContext.RegisterIPv4))
+	// RegisterIPv4 may hold a host name, so it must not go into ipv4Addresses.
+	addrs := pcfContext.SbiAddrs()
+	if addrs.Empty() {
+		return profile, fmt.Errorf("PCF address is empty. NF profile cannot be built")
+	}
+	openapiutils.SetNFProfileAddresses(&profile, addrs.FQDN, addrs.IPv4, addrs.IPv6)
 	service := []models.NFService{}
 	serviceList := map[string]models.NFService{}
 	for _, nfService := range pcfContext.NfService {

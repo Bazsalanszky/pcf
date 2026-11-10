@@ -7,7 +7,8 @@
 package util
 
 import (
-	"os"
+	"cmp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,6 +16,7 @@ import (
 	pcfContext "github.com/omec-project/pcf/context"
 	"github.com/omec-project/pcf/factory"
 	"github.com/omec-project/pcf/logger"
+	"github.com/omec-project/util/sbiaddr"
 )
 
 // InitPcfContext Init PCF Context from config file
@@ -31,14 +33,14 @@ func InitPcfContext(context *pcfContext.PCFContext) {
 	context.NrfUri = configuration.NrfUri
 	context.UriScheme = ""
 	context.RegisterIPv4 = factory.PCF_DEFAULT_IPV4 // default localhost
-	context.SBIPort = factory.PCF_DEFAULT_PORT_INT  // default port
+	context.RegisterIPv6 = ""
+	context.SbiPreference = sbiaddr.PreferIPv4
+	context.SBIPort = factory.PCF_DEFAULT_PORT_INT // default port
 	if sbi != nil {
 		if sbi.Scheme != "" {
 			context.UriScheme = models.UriScheme(sbi.Scheme)
 		}
-		if sbi.RegisterIPv4 != "" {
-			context.RegisterIPv4 = sbi.RegisterIPv4
-		}
+		setRegisterAddrs(context, sbi)
 		if sbi.Port != 0 {
 			context.SBIPort = sbi.Port
 		}
@@ -56,16 +58,11 @@ func InitPcfContext(context *pcfContext.PCFContext) {
 			}
 		}
 
-		context.BindingIPv4 = os.Getenv(sbi.BindingIPv4)
-		if context.BindingIPv4 != "" {
-			logger.UtilLog.Infoln("parsing ServerIPv4 address from ENV variable")
-		} else {
-			context.BindingIPv4 = sbi.BindingIPv4
-			if context.BindingIPv4 == "" {
-				logger.UtilLog.Warnln("error parsing ServerIPv4 address as string. Using the 0.0.0.0 address as default")
-				context.BindingIPv4 = "0.0.0.0"
-			}
+		var err error
+		if context.SbiPreference, err = sbiaddr.ParsePreference(sbi.PreferredFamily); err != nil {
+			logger.UtilLog.Warnf("SBI preferredFamily: %v; using IPv4", err)
 		}
+		setBindingAddr(context, sbi)
 	}
 	context.EnableNrfCaching = configuration.EnableNrfCaching
 	if configuration.EnableNrfCaching {
@@ -87,5 +84,38 @@ func InitPcfContext(context *pcfContext.PCFContext) {
 			pcfSuppFeats = pcfContext.NewEmptySupportedFeature()
 		}
 		context.PcfSuppFeats[service.ServiceName] = *pcfSuppFeats
+	}
+}
+
+// setRegisterAddrs resolves registerIPv4 and registerIPv6 (each an address, a
+// host name or the name of an environment variable such as POD_IP or POD_IPS)
+// into the addresses the PCF registers at the NRF. RegisterIPv4 keeps holding
+// the IPv4 address or the host name, as before; an IPv6 address goes to
+// RegisterIPv6, whichever key it came from.
+func setRegisterAddrs(context *pcfContext.PCFContext, sbi *factory.Sbi) {
+	addrs, err := sbiaddr.ResolveRegister(sbi.RegisterIPv4, sbi.RegisterIPv6)
+	if err != nil {
+		logger.UtilLog.Warnf("SBI register address: %v", err)
+	}
+	if addrs.Empty() {
+		addrs.IPv4 = factory.PCF_DEFAULT_IPV4
+	}
+	if addrs.FQDN != "" && addrs.IPv4 != "" {
+		logger.UtilLog.Warnf("SBI register address: registering FQDN %s, not IPv4 %s", addrs.FQDN, addrs.IPv4)
+	}
+	context.RegisterIPv4 = cmp.Or(addrs.FQDN, addrs.IPv4)
+	context.RegisterIPv6 = addrs.IPv6
+}
+
+// setBindingAddr sets the SBI listen host from bindingAddr, or from its legacy
+// alias bindingIPv4. Either may name an environment variable; the default is
+// 0.0.0.0, which also accepts IPv6 connections.
+func setBindingAddr(context *pcfContext.PCFContext, sbi *factory.Sbi) {
+	if strings.TrimSpace(sbi.BindingAddr) == "" && strings.TrimSpace(sbi.BindingIPv4) == "" {
+		logger.UtilLog.Warnln("SBI binding address is not set. Using the 0.0.0.0 address as default")
+	}
+	var err error
+	if context.BindingIPv4, err = sbiaddr.BindHost(sbi.BindingAddr, sbi.BindingIPv4); err != nil {
+		logger.UtilLog.Warnf("SBI binding address: %v", err)
 	}
 }
