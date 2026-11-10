@@ -15,9 +15,11 @@ import (
 	"time"
 
 	"github.com/omec-project/openapi/v2/models"
+	openapiutils "github.com/omec-project/openapi/v2/utils"
 	"github.com/omec-project/pcf/factory"
 	"github.com/omec-project/pcf/logger"
 	"github.com/omec-project/util/idgenerator"
+	"github.com/omec-project/util/sbiaddr"
 )
 
 var pcfCtx *PCFContext
@@ -38,8 +40,9 @@ type PCFContext struct {
 	NfId            string
 	Name            string
 	UriScheme       models.UriScheme
-	BindingIPv4     string
-	RegisterIPv4    string
+	BindingIPv4     string // SBI listen host; despite the name, any family
+	RegisterIPv4    string // IPv4 address or host name registered to the NRF
+	RegisterIPv6    string // IPv6 address registered to the NRF
 	Key             string
 	PEM             string
 	TimeFormat      string
@@ -60,7 +63,8 @@ type PCFContext struct {
 	AMFStatusSubsData     sync.Map // map[string]AMFStatusSubscriptionData; subscriptionID as key
 	NfStatusSubscriptions sync.Map // map[NfInstanceID]models.NrfSubscriptionData.SubscriptionId
 
-	SBIPort int
+	SBIPort       int
+	SbiPreference sbiaddr.Preference
 	// lock
 	DefaultUdrURILock        sync.RWMutex
 	EnableNrfCaching         bool
@@ -105,21 +109,39 @@ var (
 // DefaultBdtRefId BdtPolicy default value
 const DefaultBdtRefId = "BdtPolicyId-"
 
+// SbiAddrs classifies the configured register hosts (RegisterIPv4 and
+// RegisterIPv6) into an FQDN, an IPv4 and an IPv6 address.
+func (c *PCFContext) SbiAddrs() sbiaddr.RegisterAddrs {
+	addrs, err := sbiaddr.ParseRegister(c.RegisterIPv4, c.RegisterIPv6)
+	// The result is usable even when err is set: err only lists the values that
+	// were dropped, and InitPcfContext has already logged them.
+	_ = err
+	return addrs
+}
+
+// GetSbiUri is the PCF's own base URI, scheme://host:port, with an IPv6 host
+// in brackets. For an IPv4 address or a host name it is the same as the
+// former "%s://%s:%d" formatting.
+func (c *PCFContext) GetSbiUri() string {
+	return c.SbiAddrs().URI(string(c.UriScheme), c.SBIPort, c.SbiPreference)
+}
+
+// GetIPv4Uri is the PCF's own base URI. Despite the name it is not limited to
+// IPv4; it is kept for existing callers and is the same as GetSbiUri.
 func (c *PCFContext) GetIPv4Uri() string {
-	return fmt.Sprintf("%s://%s:%d", c.UriScheme, c.RegisterIPv4, c.SBIPort)
+	return c.GetSbiUri()
 }
 
 // InitNFService Init NfService with supported service list and version of services
 func (c *PCFContext) InitNFService(serviceList []factory.Service, version string) {
 	tmpVersion := strings.Split(version, ".")
 	versionUri := "v" + tmpVersion[0]
+	// RegisterIPv4 may hold a host name, so it must not go into an IPv4 field:
+	// a host name goes into fqdn, and each address into the field of its family.
+	addrs := c.SbiAddrs()
 	for index, service := range serviceList {
 		name := models.ServiceName(service.ServiceName)
-		ipEndPoints := models.NewIpEndPoint()
-		ipEndPoints.SetIpv4Address(c.RegisterIPv4)
-		ipEndPoints.SetTransport(models.TRANSPORTPROTOCOL_TCP)
-		ipEndPoints.SetPort(int32(c.SBIPort))
-		c.NfService[name] = models.NFService{
+		nfService := models.NFService{
 			ServiceInstanceId: strconv.Itoa(index),
 			ServiceName:       name,
 			Versions: []models.NFServiceVersion{
@@ -128,12 +150,17 @@ func (c *PCFContext) InitNFService(serviceList []factory.Service, version string
 					ApiVersionInUri: versionUri,
 				},
 			},
-			Scheme:            c.UriScheme,
-			NfServiceStatus:   models.NFSERVICESTATUS_REGISTERED,
-			ApiPrefix:         new(c.GetIPv4Uri()),
-			IpEndPoints:       []models.IpEndPoint{*ipEndPoints},
+			Scheme:          c.UriScheme,
+			NfServiceStatus: models.NFSERVICESTATUS_REGISTERED,
+			ApiPrefix:       new(c.GetSbiUri()),
+			// One endpoint per family (TS 29.510 allows only one address per IpEndPoint), IPv4 first.
+			IpEndPoints:       openapiutils.NewIpEndPoints(addrs.IPv4, addrs.IPv6, int32(c.SBIPort)),
 			SupportedFeatures: new(service.SuppFeat),
 		}
+		if addrs.FQDN != "" {
+			nfService.SetFqdn(addrs.FQDN)
+		}
+		c.NfService[name] = nfService
 	}
 }
 
